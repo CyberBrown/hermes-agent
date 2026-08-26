@@ -652,6 +652,61 @@ def _handle_list(args: dict, **kw) -> str:
         return tool_error(f"kanban_list: {e}")
 
 
+
+def _artifact_gate(tid: str, args: dict) -> str | None:
+    """Estate completion contract (2026-08-26): a worker may only complete with a
+    verifiable artifact. Opt out per-run with HERMES_KANBAN_ARTIFACT_GATE=0."""
+    import os, re, subprocess
+    if os.environ.get("HERMES_KANBAN_ARTIFACT_GATE", "1") == "0":
+        return None
+    if os.environ.get("HERMES_KANBAN_TASK") != tid:
+        return None
+    ws = os.environ.get("HERMES_KANBAN_WORKSPACE") or ""
+    meta = args.get("metadata") if isinstance(args.get("metadata"), dict) else {}
+    artifact = str(meta.get("artifact") or meta.get("pr_url") or "").strip()
+    arts = args.get("artifacts")
+    summary = str(args.get("summary") or "") + " " + str(args.get("result") or "")
+    has_ref = bool(artifact) or bool(arts) or bool(re.search(r"https?://\S+", summary))
+    def git(*a):
+        r = subprocess.run(["git", *a], cwd=ws, capture_output=True, text=True, timeout=60)
+        return r.returncode, r.stdout.strip()
+    if ws and os.path.isdir(ws):
+        rc, _ = git("rev-parse", "--is-inside-work-tree")
+        if rc == 0:
+            rc, branch = git("rev-parse", "--abbrev-ref", "HEAD")
+            rc2, head = git("rev-parse", "HEAD")
+            rcb, base = git("symbolic-ref", "-q", "--short", "refs/remotes/origin/HEAD")
+            if rcb != 0:
+                base = "origin/main" if git("rev-parse", "-q", "--verify", "origin/main")[0] == 0 else "origin/master"
+            if rc == 0 and branch not in ("HEAD",) and git("rev-parse", "-q", "--verify", base)[0] == 0:
+                rca, ahead = git("rev-list", "--count", f"{base}..HEAD")
+                if rca == 0 and ahead.isdigit() and int(ahead) > 0:
+                    rcr, remote = git("ls-remote", "--heads", "origin", branch)
+                    remote_sha = remote.split()[0] if remote else ""
+                    if remote_sha != head:
+                        return tool_error(
+                            f"completion contract: branch '{branch}' has {ahead} commit(s) not on origin "
+                            f"(remote={remote_sha[:8] or 'absent'} local={head[:8]}). Run `git push -u origin {branch}` "
+                            "then call kanban_complete again. If the push is impossible, kanban_block with the reason."
+                        )
+                    if git("merge-base", "--is-ancestor", base, "HEAD")[0] != 0:
+                        return tool_error(
+                            f"completion contract: branch '{branch}' is not rebased onto {base}; "
+                            f"run `git fetch origin && git rebase {base}` and push again."
+                        )
+                    if not has_ref:
+                        return tool_error(
+                            "completion contract: you pushed commits but named no artifact. Put the PR URL (or "
+                            f"'{branch}@{head[:12]}') in metadata.artifact and call kanban_complete again."
+                        )
+    if not has_ref:
+        return tool_error(
+            "completion contract: no artifact named. Set metadata.artifact to the PR URL, the branch@sha, "
+            "or the repo-relative path of the document you produced (or list files in artifacts=[...]). "
+            "If there is genuinely nothing to point at, the task is not done: kanban_block with what is missing."
+        )
+    return None
+
 def _handle_complete(args: dict, **kw) -> str:
     """Mark the current task done with a structured handoff."""
     delegated_err = _reject_delegated_child_mutation("kanban_complete")
@@ -665,6 +720,9 @@ def _handle_complete(args: dict, **kw) -> str:
     ownership_err = _enforce_worker_task_ownership(tid)
     if ownership_err:
         return ownership_err
+    gate_err = _artifact_gate(tid, args)
+    if gate_err:
+        return gate_err
     summary = args.get("summary")
     metadata = args.get("metadata")
     result = args.get("result")
