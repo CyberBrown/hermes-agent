@@ -1456,6 +1456,39 @@ def _wait_for_oneshot_background_completions(cli) -> None:
         )
 
 
+def _single_query_exit_code(result) -> int:
+    """Map a single-query turn's result dict to a process exit code.
+
+    Shared by BOTH quiet branches of ``main()`` — ``-Q`` (machine-readable)
+    and plain ``-q`` (the one the kanban dispatcher actually spawns) — so a
+    failed run can never present as a clean exit on the path its caller
+    happens to use. Returns 0 for a normal completion, 1 for a real failure,
+    and ``KANBAN_RATE_LIMIT_EXIT_CODE`` (EX_TEMPFAIL, 75) for a
+    quota/billing wall on a kanban worker: the dispatcher's reap classifier
+    maps 75 to a ``rate_limited`` release that requeues WITHOUT burning the
+    protocol-violation budget or tripping the circuit breaker, and maps
+    rc=0-with-task-still-running to a protocol violation.
+
+    Before this helper existed the mapping lived only in the ``-Q`` branch;
+    the ``-q`` branch fell through to rc=0 on every failure (provider budget
+    exhausted, unknown provider, API retries spent), which the dispatcher
+    crash-looped as "worker exited cleanly without calling kanban_complete"
+    — the exact signature of issue #1397 (OP #1397, t_adbf236a).
+    """
+    if not isinstance(result, dict) or not result.get("failed"):
+        return 0
+    if (
+        os.environ.get("HERMES_KANBAN_TASK")
+        and result.get("failure_reason") in ("rate_limit", "billing")
+    ):
+        try:
+            from hermes_cli.kanban_db import KANBAN_RATE_LIMIT_EXIT_CODE
+            return int(KANBAN_RATE_LIMIT_EXIT_CODE)
+        except Exception:
+            return 1
+    return 1
+
+
 def _finalize_single_query(cli) -> None:
     """Close one-shot CLI resources before releasing the active session lease."""
     try:
@@ -5485,6 +5518,15 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         # don't auto-queue another continuation on top of a user-cancelled
         # turn (which would make Ctrl+C feel like it did nothing).
         self._last_turn_interrupted = False
+        # The result dict from the most recent chat() turn, exposed so the
+        # non-quiet single-query branch of main() can map the turn outcome to
+        # a process exit code exactly like the -Q branch does (#1397: a `-q`
+        # kanban worker whose provider died on a quota wall fell through to
+        # rc=0 while the task was still `running`, and the dispatcher read
+        # that as a protocol violation — clean exit, no terminal board call).
+        # None until a turn completes or a known failure path records a
+        # failure dict.
+        self._last_turn_result: Optional[dict] = None
         # When stdout/PTY raises EIO (broken pipe after a stream-stall
         # interrupt), freeze further UI paints so we don't spin the main
         # thread at hundreds of escape-sequence writes/sec (#81521).
@@ -16300,6 +16342,21 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
 
         # Refresh provider credentials if needed (handles key rotation transparently)
         if not self._ensure_runtime_credentials():
+            # Fatal auth/provider failure (e.g. `model.provider: custom:coder`
+            # naming a provider that no longer exists): no turn ever ran.
+            # Record a failure dict so machine callers — the kanban worker
+            # exit path in particular — can tell "the run never started" from
+            # a clean rc=0 (issue #1397 cluster B: the dispatcher read the
+            # silent rc=0 as a protocol violation and crash-looped the card).
+            self._last_turn_result = {
+                "final_response": None,
+                "messages": [],
+                "api_calls": 0,
+                "completed": False,
+                "failed": True,
+                "error": "Provider/credential resolution failed",
+                "failure_reason": "auth",
+            }
             return None
 
         turn_route = self._resolve_turn_agent_config(message)
@@ -16314,9 +16371,30 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             runtime_override=turn_route["runtime"],
             request_overrides=turn_route.get("request_overrides"),
         ):
+            # Same contract as the credential-failure path above: the -Q
+            # branch exits 1 on init failure; chat() must record the failure
+            # so the -q branch's exit mapper sees it too (#1397).
+            self._last_turn_result = {
+                "final_response": None,
+                "messages": [],
+                "api_calls": 0,
+                "completed": False,
+                "failed": True,
+                "error": "Agent initialization failed",
+                "failure_reason": "init",
+            }
             return None
         agent = self.agent
         if agent is None:
+            self._last_turn_result = {
+                "final_response": None,
+                "messages": [],
+                "api_calls": 0,
+                "completed": False,
+                "failed": True,
+                "error": "Agent unavailable after init",
+                "failure_reason": "init",
+            }
             return None
 
         # Route image attachments based on the active model's vision capability.
@@ -16450,9 +16528,12 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         ChatConsole().print(f"[{_accent_hex()}]{'─' * 40}[/]")
         print(flush=True)
         
+        # Hoisted above the try so the except handler below can inspect the
+        # turn result without a possibly-unbound variable (#1397 exit-code
+        # contract). Stays None if the throw lands before run_conversation.
+        result = None
         try:
             # Run the conversation with interrupt monitoring
-            result = None
 
             # Reset streaming display state for this turn
             self._reset_stream_state()
@@ -17091,10 +17172,30 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 print(f"\n⏩ Delivering leftover /steer as next turn: '{preview}'")
                 self._pending_input.put(_leftover_steer)
 
+            # Expose the turn's result dict for the single-query exit-code
+            # mapping in main() (see _last_turn_result). The -Q branch reads
+            # its local `result` directly; the human-facing -q branch calls
+            # chat() and needs this handle to reach the same contract.
+            self._last_turn_result = result
+
             return response
             
         except Exception as e:
             print(f"Error: {e}")
+            # Never let an exception inside chat() surface as rc=0 to a
+            # machine caller: record it as a failed turn so the -q exit
+            # mapper returns 1 (#1397). result may be a partial dict if the
+            # throw happened after run_conversation returned.
+            if not isinstance(result, dict) or not result.get("failed"):
+                self._last_turn_result = {
+                    "final_response": None,
+                    "messages": [],
+                    "api_calls": 0,
+                    "completed": False,
+                    "failed": True,
+                    "error": f"{type(e).__name__}: {e}",
+                    "failure_reason": "exception",
+                }
             return None
         finally:
             # Stop the ambient thinking sound the moment the turn ends —
@@ -21601,31 +21702,11 @@ def main(
                         print(f"\nsession_id: {cli.session_id}", file=sys.stderr)
 
                         # Ensure proper exit code for automation wrappers.
-                        #
-                        # Kanban workers get a special case: when the run failed
-                        # purely because the provider rate-limited / exhausted
-                        # quota (not because the task itself is broken), exit with
-                        # the EX_TEMPFAIL sentinel instead of the generic 1. The
-                        # dispatcher's reap classifier maps that code to a
-                        # ``rate_limited`` exit and releases the task back to
-                        # ``ready`` WITHOUT incrementing the failure counter, so a
-                        # 5-hour quota window can't trip the circuit breaker and
-                        # permanently block the card. Non-kanban runs keep the
-                        # plain 0/1 contract automation wrappers expect.
-                        _exit_code = 0
-                        if isinstance(result, dict) and result.get("failed"):
-                            _exit_code = 1
-                            if os.environ.get("HERMES_KANBAN_TASK") and result.get(
-                                "failure_reason"
-                            ) in ("rate_limit", "billing"):
-                                try:
-                                    from hermes_cli.kanban_db import (
-                                        KANBAN_RATE_LIMIT_EXIT_CODE as _RL_CODE,
-                                    )
-                                    _exit_code = _RL_CODE
-                                except Exception:
-                                    _exit_code = 1
-                        sys.exit(_exit_code)
+                        # Kanban rate-limit / billing walls map to the
+                        # EX_TEMPFAIL sentinel (see _single_query_exit_code);
+                        # same contract now shared with the plain -q branch
+                        # the dispatcher spawns workers with (#1397).
+                        sys.exit(_single_query_exit_code(result))
 
                 # Exit with error code if credentials or agent init fails
                 sys.exit(1)
@@ -21651,6 +21732,22 @@ def main(
                 cli._show_security_advisories()
                 cli.chat(query, images=single_query_images or None)
                 cli._print_exit_summary(clear_screen=False)
+                # Same exit-code contract as the -Q branch above (#1397).
+                # Before this, the human-facing -q path — which is exactly
+                # what the kanban dispatcher spawns (`hermes -p <lane> --cli
+                # chat -q "work kanban task <id>"`) — fell through to rc=0
+                # no matter how the turn ended. A provider quota wall (429
+                # budget exceeded) or a dead provider config therefore looked
+                # like "worker exited cleanly without calling kanban_complete
+                # / kanban_block — protocol violation" to the dispatcher's
+                # reap classifier, consuming the violation budget and parking
+                # the card `blocked` even though the worker never got a turn.
+                # Route chat()'s recorded result through the shared mapper.
+                _sq_exit_code = _single_query_exit_code(
+                    getattr(cli, "_last_turn_result", None)
+                )
+                if _sq_exit_code:
+                    sys.exit(_sq_exit_code)
         finally:
             _finalize_single_query(cli)
         return
